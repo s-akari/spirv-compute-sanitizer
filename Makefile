@@ -21,7 +21,6 @@ $(OUT_BIN)/%: runner/%.c | $(OUT_BIN)
 $(OUT_KERNEL)/%.spv: kernel/%.cl | $(OUT_KERNEL)
 	$(CLANG) -target spirv64 -c $< -o $@
 
-# 個別ファイルビルド用の規則
 .PHONY: runner/%.c kernel/%.cl
 
 runner/%.c:
@@ -30,8 +29,7 @@ runner/%.c:
 kernel/%.cl:
 	@$(MAKE) $(OUT_KERNEL)/$(basename $(notdir $@)).spv
 
-# 便利なエイリアス
-.PHONY: build-kernel build-runner help
+.PHONY: build-kernel build-runner
 
 build-kernel/%:
 	@if [ ! -f kernel/$*.cl ]; then \

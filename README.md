@@ -35,13 +35,15 @@ CUDAの [Compute Sanitizer](https://docs.nvidia.com/compute-sanitizer/ComputeSan
 make
 ```
 
+それぞれのカーネルやランナーがどのようなものかは、ソースコードの最初のコメントを参照してください。
+
 カーネルの個別ビルド:
 
 ```bash
 make build-kernel/<kernel_name>
 
 # 例:
-make build-kernel/add # out/kernel/add.spv
+make build-kernel/add # kernel/add.cl -> out/kernel/add.spv
 ```
 
 `out/kernel/`にビルドされたカーネルのSPIR-Vバイナリが出力されます。
@@ -52,7 +54,7 @@ make build-kernel/add # out/kernel/add.spv
 make build-runner/<runner_name>
 
 # 例:
-make build-runner/a-b-c # out/bin/a-b-c
+make build-runner/a-b-c # runner/a-b-c.c -> out/bin/a-b-c
 ```
 
 `out/bin/`にビルドされたランナーの実行ファイルが出力されます。
@@ -60,7 +62,7 @@ make build-runner/a-b-c # out/bin/a-b-c
 実行:
 
 ```bash
-<runner_name> <kernel_name>
+<runner> <kernel>
 
 # 例:
 out/bin/a-b-c out/kernel/add.spv
@@ -68,5 +70,5 @@ out/bin/a-b-c out/kernel/add.spv
 
 ## 参考リンク
 
-https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html
-https://github.com/NVIDIA/compute-sanitizer-samples
+- https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html
+- https://github.com/NVIDIA/compute-sanitizer-samples
