@@ -4,7 +4,7 @@ CLANG=clang
 OUT_BIN=out/bin
 OUT_KERNEL=out/kernel
 
-CFLAGS=-Wall -Wextra -g -fno-omit-frame-pointer -fsanitize=address
+CFLAGS=-Wall -Wextra -g -fno-omit-frame-pointer
 LDFLAGS=-lOpenCL
 
 C_SRCS := $(wildcard runner/*.c)
