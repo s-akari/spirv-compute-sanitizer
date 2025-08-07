@@ -22,8 +22,9 @@ CUDAの [Compute Sanitizer](https://docs.nvidia.com/compute-sanitizer/ComputeSan
 
 ### 構造
 
-ソースコードは以下の2つのディレクトリに分かれています。
+ソースコードは以下の3つのディレクトリに分かれています。
 
+- `common`: `runner`から使用される共通の実装
 - `kernel`: OpenCL カーネルのソースコード
 - `runner`: OpenCL カーネルを実行するためのランナー (Cの単一ソースファイル)
 
