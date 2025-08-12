@@ -147,18 +147,8 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
   traverse(F, ArraySizeLinks, *ThenBlock, depth + 1);
 }
 
-PreservedAnalyses SPIRVComputeSanitizerPass::run(Function &F,
-                                                 FunctionAnalysisManager &FAM) {
-  if (const Module *M = F.getParent(); !shouldRun(*M)) {
-    errs() << "SPIRVComputeSanitizerPass: Not running on non-SPIR-V module\n";
-
-    return PreservedAnalyses::all(); // Don't run if not SPIR-V
-  }
-
-  errs() << "SPIRVComputeSanitizerPass: Running on SPIR-V module\n";
-
-  // Link Args Identifier (assume second pair as 0)
-  std::vector<ArraySizeLink> ArraySizeLinks;
+static std::vector<ArraySizeLink> find_array_size_links(Function &F) {
+  std::vector<ArraySizeLink> ret;
 
   std::optional<size_t> FoundArraySizeLink;
   for (auto &Arg : F.args()) {
@@ -173,7 +163,7 @@ PreservedAnalyses SPIRVComputeSanitizerPass::run(Function &F,
     if (Arg.getType()->isIntegerTy()) {
       if (Arg.getType()->getIntegerBitWidth() % 32 == 0) {
         if (FoundArraySizeLink) {
-          ArraySizeLinks.push_back(
+          ret.push_back(
               {F.getArg(FoundArraySizeLink.value()), &Arg});
 
           FoundArraySizeLink.reset();
@@ -182,11 +172,11 @@ PreservedAnalyses SPIRVComputeSanitizerPass::run(Function &F,
     }
   }
 
-  auto &Block = F.getEntryBlock();
+  return ret;
+}
 
-  traverse(F, ArraySizeLinks, Block);
-
-  errs() << "\nLinks found:\n";
+static void print_links(const std::vector<ArraySizeLink> &ArraySizeLinks) {
+  errs() << "Links found:\n";
 
   for (const auto &[ArrayArg, SizeArg] : ArraySizeLinks) {
     if (ArrayArg->getType()->isPointerTy()) {
@@ -196,6 +186,26 @@ PreservedAnalyses SPIRVComputeSanitizerPass::run(Function &F,
       errs() << "Invalid link found: " << *ArrayArg << "\n";
     }
   }
+}
+
+PreservedAnalyses SPIRVComputeSanitizerPass::run(Function &F,
+                                                 FunctionAnalysisManager &FAM) {
+  if (const Module *M = F.getParent(); !shouldRun(*M)) {
+    errs() << "SPIRVComputeSanitizerPass: Not running on non-SPIR-V module\n";
+
+    return PreservedAnalyses::all(); // Don't run if not SPIR-V
+  }
+
+  errs() << "SPIRVComputeSanitizerPass: Running on SPIR-V module\n";
+
+  std::vector<ArraySizeLink> ArraySizeLinks = find_array_size_links(F);
+
+  auto &Block = F.getEntryBlock();
+
+  traverse(F, ArraySizeLinks, Block);
+
+  errs() << "\n";
+  print_links(ArraySizeLinks);
 
   return PreservedAnalyses::all();
 }
