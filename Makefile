@@ -6,7 +6,7 @@ OUT_KERNEL=out/kernel
 OUT_OBJ=out/obj
 
 INCLUDE_DIRS=common/include
-CFLAGS=-Wall -Wextra -g -fno-omit-frame-pointer $(addprefix -I,$(INCLUDE_DIRS))
+CFLAGS=-Wall -Wextra -g -fno-omit-frame-pointer -fsanitize=address $(addprefix -I,$(INCLUDE_DIRS))
 LDFLAGS=-lOpenCL
 
 C_SRCS := $(wildcard runner/*.c)
