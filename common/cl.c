@@ -115,6 +115,9 @@ int load_spv_program(OpenCLContext *ctx, const char *path,
       return -1;
     }
 
+    clGetProgramBuildInfo(ctx->program, ctx->device, CL_PROGRAM_BUILD_LOG,
+                          log_size, log, NULL);
+
     fprintf(stderr, "OpenCL error (%d): Failed to build program: %s\n", err,
             log);
 
