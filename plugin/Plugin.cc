@@ -7,20 +7,15 @@
 namespace llvm {
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {
-      LLVM_PLUGIN_API_VERSION, "SPIR-V Compute Sanitizer plugin", "v0.1",
-      [](PassBuilder &PB) {
-        PB.registerPipelineParsingCallback(
-            [](StringRef Name, FunctionPassManager &FPM,
-               ArrayRef<PassBuilder::PipelineElement>) {
-              if (Name != "spirv-compute-sanitizer")
-                return false;
-
+  return {LLVM_PLUGIN_API_VERSION, "SPIR-V Compute Sanitizer plugin", "v0.1",
+          [](PassBuilder &PB) {
+            PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM,
+                                                   OptimizationLevel) {
+              FunctionPassManager FPM;
               FPM.addPass(SPIRVComputeSanitizerPass());
-
-              return true;
+              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
             });
-      }};
+          }};
 }
 
 } // namespace llvm

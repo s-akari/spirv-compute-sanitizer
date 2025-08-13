@@ -29,7 +29,7 @@ $(OUT_OBJ)/%.o: common/%.c | $(OUT_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUT_KERNEL)/%.spv: kernel/%.cl | $(OUT_KERNEL)
-	$(CLANG) -target spirv64 -c $< -o $@
+	$(CLANG) -target spirv64 -fpass-plugin=plugin/build/libSPIRVComputeSanitizer.so -c $< -o $@
 
 .PHONY: runner/%.c kernel/%.cl
 

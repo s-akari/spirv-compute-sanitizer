@@ -2,8 +2,5 @@
 
 kernel void run(constant float *a, const unsigned long a_size, constant float *b, const unsigned long b_size, global float *c, const unsigned long c_size) {
   size_t id = get_global_id(0);
-  size_t a_id = id + 3;
-  c[id] = a[id] + b[a_id];
-
-  printf("%zu", a_id); // opt
+  c[id] = a[id] + b[id + 3];
 }

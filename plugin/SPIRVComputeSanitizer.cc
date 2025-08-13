@@ -8,9 +8,14 @@
 
 #define DEBUG_TYPE "spirv-compute-sanitizer"
 
+using namespace std::literals;
 using namespace llvm;
 
-static constexpr unsigned ConstantAddressSpace = 2; // SPIR-V constant address space
+static constexpr char get_global_id_name[] = "_Z13get_global_idj";
+static constexpr char get_local_id_name[] = "_Z12get_local_idj";
+
+static constexpr unsigned ConstantAddressSpace =
+    2; // SPIR-V constant address space
 
 static bool isSPIRVTriple(const Triple &T) {
   const StringRef Arch = T.getArchName();
@@ -32,9 +37,36 @@ struct ArraySizeLink {
   Argument *SizeArg;
 };
 
+struct SanitizerMessageCtx {
+  bool Created = false;
+  GlobalVariable *FormatIndexOutOfBounds = nullptr;
+  GlobalVariable *FormatLocalMemoryConflict = nullptr;
+
+  void createFormatStrings(IRBuilder<> &Builder) {
+    if (Created)
+      return;
+
+    FormatIndexOutOfBounds =
+        Builder.CreateGlobalString("\n[ComputeSanitizer] (Global #%zu, Local "
+                                   "#%zu) Array index out of bounds\n",
+                                   "", ConstantAddressSpace);
+    FormatLocalMemoryConflict =
+        Builder.CreateGlobalString("\n[ComputeSanitizer] (Global #%zu, Local "
+                                   "#%zu) Local memory conflict detected\n",
+                                   "", ConstantAddressSpace);
+
+    Created = true;
+  }
+};
+
 static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
-                     BasicBlock &Block, const int depth = 0) {
-  std::optional<BasicBlock::iterator> maybe_gep;
+                     BasicBlock &Block, const int depth = 0,
+                     SanitizerMessageCtx MessageCtx = {}) {
+  std::optional<std::pair<BasicBlock::iterator, Argument *>> maybe_gep_pair;
+
+  // Create a global string variable once to avoid string deduplication bug
+  IRBuilder<> Builder(&Block);
+  MessageCtx.createFormatStrings(Builder);
 
   auto Inst = Block.begin();
 
@@ -46,7 +78,7 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
       // Find the array argument in the GEP instruction
       if (GetElementPtr->getNumOperands() != 2) {
         errs() << "Skipping GEP with unexpected number of operands: "
-               << GetElementPtr->getName() << "\n";
+               << *GetElementPtr << "\n";
 
         continue;
       }
@@ -54,7 +86,56 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
       auto *PtrOperand_ = GetElementPtr->getOperand(0);
       auto *PtrOperand = dyn_cast<Argument>(PtrOperand_);
 
-      if (!PtrOperand || !PtrOperand->getType()->isPointerTy()) {
+      if (!PtrOperand) {
+        // If the pointer operand is not an argument, check if it's a load
+        auto PtrLoad = dyn_cast<LoadInst>(PtrOperand_);
+
+        if (!PtrLoad) {
+          errs() << "Skipping GEP with non-argument pointer operand: "
+                 << *PtrOperand_ << "\n";
+
+          continue; // Not an argument, skip
+        }
+
+        PtrOperand = dyn_cast<Argument>(PtrLoad->getPointerOperand());
+
+        if (!PtrOperand) {
+          // If the pointer load is not an argument, check if it's an alloca
+          auto PtrAlloca = dyn_cast<AllocaInst>(PtrLoad->getPointerOperand());
+
+          if (!PtrAlloca) {
+            errs() << "Skipping GEP with non-argument pointer load: "
+                   << *PtrOperand_ << "\n";
+
+            continue; // Not an argument, skip
+          }
+
+          // Find the first store instruction that stores to the alloca
+          auto MaybeStore = std::find_if(
+              PtrAlloca->user_begin(), PtrAlloca->user_end(),
+              [=](const User *U) {
+                return isa<StoreInst>(U) &&
+                       cast<StoreInst>(U)->getPointerOperand() == PtrAlloca;
+              });
+
+          if (MaybeStore == PtrAlloca->user_end()) {
+            errs() << "Skipping GEP with alloca that has no store: "
+                   << *PtrAlloca << "\n";
+
+            continue; // No store found, skip
+          }
+
+          PtrOperand =
+              dyn_cast<Argument>(cast<StoreInst>(*MaybeStore)->getOperand(0));
+
+          if (!PtrOperand) {
+            errs() << "Skipping GEP with alloca that has non-argument store: "
+                   << *PtrOperand_ << "\n";
+
+            continue; // Not an argument, skip
+          }
+        }
+      } else if (PtrOperand && !PtrOperand->getType()->isPointerTy()) {
         errs() << "Skipping GEP with non-pointer array argument: "
                << *PtrOperand_ << "\n";
 
@@ -86,7 +167,7 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
         continue;
       }
 
-      maybe_gep = Inst;
+      maybe_gep_pair = std::make_pair(Inst, PtrOperand);
 
       errs() << "Found instruction: " << *Inst << "\n";
 
@@ -94,31 +175,30 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
     }
   }
 
-  if (!maybe_gep) {
+  if (!maybe_gep_pair) {
     errs() << "No GEP instructions found in the block.\n";
 
     return; // No GEP instructions found
   }
 
-  const auto GetElementPtr = maybe_gep.value();
-  const auto PtrOperand = dyn_cast<Argument>(GetElementPtr->getOperand(0));
+  auto gep_pair = maybe_gep_pair.value();
+  auto GetElementPtr = gep_pair.first;
+  auto *PtrOperand = gep_pair.second;
   const auto IndexOperand = GetElementPtr->getOperand(1);
-  const auto LinkEntry = std::find_if(
-      ArraySizeLinks.begin(), ArraySizeLinks.end(),
-      [&](const ArraySizeLink &Link) {
-        return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
-      });
+  const auto LinkEntry =
+      std::find_if(ArraySizeLinks.begin(), ArraySizeLinks.end(),
+                   [&](const ArraySizeLink &Link) {
+                     return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
+                   });
 
   if (LinkEntry == ArraySizeLinks.end()) {
-    errs() << "No size argument found for the array argument: "
-           << *PtrOperand << "\n";
+    errs() << "No size argument found for the array argument: " << *PtrOperand
+           << "\n";
 
     return; // No size argument found
   }
 
   auto *SizeArg = LinkEntry->SizeArg;
-
-  IRBuilder<> Builder(&Block);
 
   auto *ThenBlock = BasicBlock::Create(F.getContext(), "", &F);
   auto *ElseBlock = BasicBlock::Create(F.getContext(), "", &F);
@@ -126,25 +206,48 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
   // Move all instructions after the last GEP instruction to the new block
   ThenBlock->splice(ThenBlock->begin(), &Block, GetElementPtr, Block.end());
 
-  auto *SizeCheck =
-      Builder.CreateICmpULT(IndexOperand, SizeArg);
+  auto *SizeCheck = Builder.CreateICmpULT(IndexOperand, SizeArg);
 
   IRBuilder<> ElseBuilder(ElseBlock);
 
-  // Add printf("Array size mismatch") call to report_block
+  // get_global_id(0)
+  auto GetGlobalIdFC = F.getParent()->getOrInsertFunction(
+      get_global_id_name,
+      FunctionType::get(IntegerType::getInt64Ty(F.getContext()),
+                        {IntegerType::getInt32Ty(F.getContext())}, false));
+  auto GetGlobalIdFunc = cast<Function>(GetGlobalIdFC.getCallee());
+  GetGlobalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
+  auto GlobalIdCall = ElseBuilder.CreateCall(
+      GetGlobalIdFC,
+      {ConstantInt::get(IntegerType::getInt32Ty(F.getContext()), 0)});
+  GlobalIdCall->setCallingConv(CallingConv::SPIR_FUNC);
+
+  // get_local_id(0)
+  auto GetLocalIdFC = F.getParent()->getOrInsertFunction(
+      get_local_id_name,
+      FunctionType::get(IntegerType::getInt64Ty(F.getContext()),
+                        {IntegerType::getInt32Ty(F.getContext())}, false));
+  auto GetLocalIdFunc = cast<Function>(GetLocalIdFC.getCallee());
+  GetLocalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
+  auto LocalIdCall = ElseBuilder.CreateCall(
+      GetLocalIdFC,
+      {ConstantInt::get(IntegerType::getInt32Ty(F.getContext()), 0)});
+  LocalIdCall->setCallingConv(CallingConv::SPIR_FUNC);
+
   const auto PrintfFunc = F.getParent()->getOrInsertFunction(
       "printf",
       FunctionType::get(IntegerType::getInt32Ty(F.getContext()),
                         PointerType::get(Type::getInt8Ty(F.getContext()), ConstantAddressSpace),
                         true));
-  auto *FormatStr = ElseBuilder.CreateGlobalString("\n[ComputeSanitizer] Array index out of bounds\n", "", ConstantAddressSpace);
 
-  ElseBuilder.CreateCall(PrintfFunc, {FormatStr});
+  auto PrintfCI = ElseBuilder.CreateCall(PrintfFunc, {MessageCtx.FormatIndexOutOfBounds, GlobalIdCall, LocalIdCall});
+  PrintfCI->setCallingConv(CallingConv::SPIR_FUNC);
+
   ElseBuilder.CreateRetVoid();
 
   Builder.CreateCondBr(SizeCheck, ThenBlock, ElseBlock);
 
-  traverse(F, ArraySizeLinks, *ThenBlock, depth + 1);
+  traverse(F, ArraySizeLinks, *ThenBlock, depth + 1, MessageCtx);
 }
 
 static std::vector<ArraySizeLink> find_array_size_links(Function &F) {
