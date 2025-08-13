@@ -59,6 +59,199 @@ struct SanitizerMessageCtx {
   }
 };
 
+static CallInst *create_printf_call(IRBuilder<> &Builder,
+                                    ArrayRef<Value *> Args) {
+  auto PrintfFunc = Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
+      "printf",
+      FunctionType::get(IntegerType::getInt32Ty(Builder.getContext()),
+                        PointerType::get(Type::getInt8Ty(Builder.getContext()),
+                                         ConstantAddressSpace),
+                        true));
+
+  auto PrintfCI = Builder.CreateCall(PrintfFunc, Args);
+  PrintfCI->setCallingConv(CallingConv::SPIR_FUNC);
+
+  return PrintfCI;
+}
+
+static CallInst *create_get_global_id_call(IRBuilder<> &Builder, unsigned dim) {
+  auto GetGlobalIdFC =
+      Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
+          get_global_id_name,
+          FunctionType::get(IntegerType::getInt64Ty(Builder.getContext()),
+                            {IntegerType::getInt32Ty(Builder.getContext())},
+                            false));
+  auto *GetGlobalIdFunc = cast<Function>(GetGlobalIdFC.getCallee());
+  GetGlobalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
+
+  return Builder.CreateCall(
+      GetGlobalIdFC,
+      {ConstantInt::get(IntegerType::getInt32Ty(Builder.getContext()), dim)});
+}
+
+static CallInst *create_get_local_id_call(IRBuilder<> &Builder, unsigned dim) {
+  auto GetLocalIdFC =
+      Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
+          get_local_id_name,
+          FunctionType::get(IntegerType::getInt64Ty(Builder.getContext()),
+                            {IntegerType::getInt32Ty(Builder.getContext())},
+                            false));
+  auto *GetLocalIdFunc = cast<Function>(GetLocalIdFC.getCallee());
+  GetLocalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
+
+  return Builder.CreateCall(
+      GetLocalIdFC,
+      {ConstantInt::get(IntegerType::getInt32Ty(Builder.getContext()), dim)});
+}
+
+static std::optional<std::pair<BasicBlock::iterator, Argument *>>
+find_injectable_gep(std::vector<ArraySizeLink> &ArraySizeLinks,
+                    BasicBlock::iterator Inst,
+                    const GetElementPtrInst *GetElementPtr) {
+  // Find the array argument in the GEP instruction
+  if (GetElementPtr->getNumOperands() != 2) {
+    errs() << "Skipping GEP with unexpected number of operands: "
+           << *GetElementPtr << "\n";
+
+    return std::nullopt;
+  }
+
+  auto *PtrOperand_ = GetElementPtr->getOperand(0);
+  auto *PtrOperand = dyn_cast<Argument>(PtrOperand_);
+
+  if (!PtrOperand) {
+    // If the pointer operand is not an argument, check if it's a load
+    auto PtrLoad = dyn_cast<LoadInst>(PtrOperand_);
+
+    if (!PtrLoad) {
+      errs() << "Skipping GEP with non-argument pointer operand: "
+             << *PtrOperand_ << "\n";
+
+      return std::nullopt; // Not an argument, skip
+    }
+
+    PtrOperand = dyn_cast<Argument>(PtrLoad->getPointerOperand());
+
+    if (!PtrOperand) {
+      // If the pointer load is not an argument, check if it's an alloca
+      auto PtrAlloca = dyn_cast<AllocaInst>(PtrLoad->getPointerOperand());
+
+      if (!PtrAlloca) {
+        errs() << "Skipping GEP with non-argument pointer load: "
+               << *PtrOperand_ << "\n";
+
+        return std::nullopt; // Not an argument, skip
+      }
+
+      // Find the first store instruction that stores to the alloca
+      auto MaybeStore = std::find_if(
+          PtrAlloca->user_begin(), PtrAlloca->user_end(), [=](const User *U) {
+            return isa<StoreInst>(U) &&
+                   cast<StoreInst>(U)->getPointerOperand() == PtrAlloca;
+          });
+
+      if (MaybeStore == PtrAlloca->user_end()) {
+        errs() << "Skipping GEP with alloca that has no store: " << *PtrAlloca
+               << "\n";
+
+        return std::nullopt; // No store found, skip
+      }
+
+      PtrOperand =
+          dyn_cast<Argument>(cast<StoreInst>(*MaybeStore)->getOperand(0));
+
+      if (!PtrOperand) {
+        errs() << "Skipping GEP with alloca that has non-argument store: "
+               << *PtrOperand_ << "\n";
+
+        return std::nullopt; // Not an argument, skip
+      }
+    }
+  } else if (!PtrOperand->getType()->isPointerTy()) {
+    errs() << "Skipping GEP with non-pointer array argument: " << *PtrOperand_
+           << "\n";
+
+    return std::nullopt; // Not a pointer type, skip
+  }
+
+  // Find the size argument in the GEP instruction
+  auto *IndexOperand_ = GetElementPtr->getOperand(1);
+  const auto *IndexOperand = dyn_cast<Value>(IndexOperand_);
+
+  if (!IndexOperand || !IndexOperand->getType()->isIntegerTy()) {
+    errs() << "Skipping GEP with non-integer size argument: " << *IndexOperand_
+           << "\n";
+
+    return std::nullopt; // Not an integer type, skip
+  }
+
+  // Are these arguments linked?
+  const auto is_linked =
+      std::any_of(ArraySizeLinks.begin(), ArraySizeLinks.end(),
+                  [&](const ArraySizeLink &Link) {
+                    return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
+                  });
+
+  if (!is_linked) {
+    errs() << "Found GEP with unlinked array and size arguments: "
+           << *PtrOperand << ", " << *IndexOperand << "\n";
+
+    return std::nullopt;
+  }
+
+  return std::make_pair(Inst, PtrOperand);
+}
+
+static BasicBlock *
+inject_gep_check(Function &F, BasicBlock &Block, IRBuilder<> &Builder,
+                 std::vector<ArraySizeLink> &ArraySizeLinks,
+                 SanitizerMessageCtx MessageCtx,
+                 const std::pair<BasicBlock::iterator, Argument *> &gep_pair) {
+  auto GetElementPtr = gep_pair.first;
+  auto *PtrOperand = gep_pair.second;
+
+  const auto IndexOperand = GetElementPtr->getOperand(1);
+  const auto LinkEntry =
+      std::find_if(ArraySizeLinks.begin(), ArraySizeLinks.end(),
+                   [&](const ArraySizeLink &Link) {
+                     return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
+                   });
+
+  if (LinkEntry == ArraySizeLinks.end()) {
+    errs() << "No size argument found for the array argument: " << *PtrOperand
+           << "\n";
+
+    return nullptr; // No size argument found
+  }
+
+  auto *SizeArg = LinkEntry->SizeArg;
+
+  auto *ThenBlock = BasicBlock::Create(F.getContext(), "", &F);
+  auto *ElseBlock = BasicBlock::Create(F.getContext(), "", &F);
+
+  // Move all instructions after the last GEP instruction to the new block
+  ThenBlock->splice(ThenBlock->begin(), &Block, GetElementPtr, Block.end());
+
+  auto *SizeCheck = Builder.CreateICmpULT(IndexOperand, SizeArg);
+
+  IRBuilder<> ElseBuilder(ElseBlock);
+
+  // get_global_id(0)
+  auto GlobalIdCall = create_get_global_id_call(ElseBuilder, 0);
+
+  // get_local_id(0)
+  auto LocalIdCall = create_get_local_id_call(ElseBuilder, 0);
+
+  create_printf_call(ElseBuilder, {MessageCtx.FormatIndexOutOfBounds,
+                                   GlobalIdCall, LocalIdCall});
+
+  ElseBuilder.CreateRetVoid();
+
+  Builder.CreateCondBr(SizeCheck, ThenBlock, ElseBlock);
+
+  return ThenBlock;
+}
+
 static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
                      BasicBlock &Block, const int depth = 0,
                      SanitizerMessageCtx MessageCtx = {}) {
@@ -75,179 +268,22 @@ static void traverse(Function &F, std::vector<ArraySizeLink> &ArraySizeLinks,
 
   for (const auto E = Block.end(); Inst != E; ++Inst) {
     if (const auto *GetElementPtr = dyn_cast<GetElementPtrInst>(Inst)) {
-      // Find the array argument in the GEP instruction
-      if (GetElementPtr->getNumOperands() != 2) {
-        errs() << "Skipping GEP with unexpected number of operands: "
-               << *GetElementPtr << "\n";
+      maybe_gep_pair = find_injectable_gep(ArraySizeLinks, Inst, GetElementPtr);
 
-        continue;
+      if (maybe_gep_pair) {
+        errs() << "Found instruction: " << *Inst << "\n";
+
+        break;
       }
-
-      auto *PtrOperand_ = GetElementPtr->getOperand(0);
-      auto *PtrOperand = dyn_cast<Argument>(PtrOperand_);
-
-      if (!PtrOperand) {
-        // If the pointer operand is not an argument, check if it's a load
-        auto PtrLoad = dyn_cast<LoadInst>(PtrOperand_);
-
-        if (!PtrLoad) {
-          errs() << "Skipping GEP with non-argument pointer operand: "
-                 << *PtrOperand_ << "\n";
-
-          continue; // Not an argument, skip
-        }
-
-        PtrOperand = dyn_cast<Argument>(PtrLoad->getPointerOperand());
-
-        if (!PtrOperand) {
-          // If the pointer load is not an argument, check if it's an alloca
-          auto PtrAlloca = dyn_cast<AllocaInst>(PtrLoad->getPointerOperand());
-
-          if (!PtrAlloca) {
-            errs() << "Skipping GEP with non-argument pointer load: "
-                   << *PtrOperand_ << "\n";
-
-            continue; // Not an argument, skip
-          }
-
-          // Find the first store instruction that stores to the alloca
-          auto MaybeStore = std::find_if(
-              PtrAlloca->user_begin(), PtrAlloca->user_end(),
-              [=](const User *U) {
-                return isa<StoreInst>(U) &&
-                       cast<StoreInst>(U)->getPointerOperand() == PtrAlloca;
-              });
-
-          if (MaybeStore == PtrAlloca->user_end()) {
-            errs() << "Skipping GEP with alloca that has no store: "
-                   << *PtrAlloca << "\n";
-
-            continue; // No store found, skip
-          }
-
-          PtrOperand =
-              dyn_cast<Argument>(cast<StoreInst>(*MaybeStore)->getOperand(0));
-
-          if (!PtrOperand) {
-            errs() << "Skipping GEP with alloca that has non-argument store: "
-                   << *PtrOperand_ << "\n";
-
-            continue; // Not an argument, skip
-          }
-        }
-      } else if (PtrOperand && !PtrOperand->getType()->isPointerTy()) {
-        errs() << "Skipping GEP with non-pointer array argument: "
-               << *PtrOperand_ << "\n";
-
-        continue; // Not a pointer type, skip
-      }
-
-      // Find the size argument in the GEP instruction
-      auto *IndexOperand_ = GetElementPtr->getOperand(1);
-      const auto *IndexOperand = dyn_cast<Value>(IndexOperand_);
-
-      if (!IndexOperand || !IndexOperand->getType()->isIntegerTy()) {
-        errs() << "Skipping GEP with non-integer size argument: "
-               << *IndexOperand_ << "\n";
-
-        continue; // Not an integer type, skip
-      }
-
-      // Are these arguments linked?
-      const auto is_linked = std::any_of(
-          ArraySizeLinks.begin(), ArraySizeLinks.end(),
-          [&](const ArraySizeLink &Link) {
-            return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
-          });
-
-      if (!is_linked) {
-        errs() << "Found GEP with unlinked array and size arguments: "
-               << *PtrOperand << ", " << *IndexOperand << "\n";
-
-        continue;
-      }
-
-      maybe_gep_pair = std::make_pair(Inst, PtrOperand);
-
-      errs() << "Found instruction: " << *Inst << "\n";
-
-      break;
     }
   }
 
-  if (!maybe_gep_pair) {
-    errs() << "No GEP instructions found in the block.\n";
+  if (maybe_gep_pair) {
+    auto ThenBlock = inject_gep_check(F, Block, Builder, ArraySizeLinks,
+                                      MessageCtx, maybe_gep_pair.value());
 
-    return; // No GEP instructions found
+    traverse(F, ArraySizeLinks, *ThenBlock, depth + 1, MessageCtx);
   }
-
-  auto gep_pair = maybe_gep_pair.value();
-  auto GetElementPtr = gep_pair.first;
-  auto *PtrOperand = gep_pair.second;
-  const auto IndexOperand = GetElementPtr->getOperand(1);
-  const auto LinkEntry =
-      std::find_if(ArraySizeLinks.begin(), ArraySizeLinks.end(),
-                   [&](const ArraySizeLink &Link) {
-                     return Link.ArrayArg->getArgNo() == PtrOperand->getArgNo();
-                   });
-
-  if (LinkEntry == ArraySizeLinks.end()) {
-    errs() << "No size argument found for the array argument: " << *PtrOperand
-           << "\n";
-
-    return; // No size argument found
-  }
-
-  auto *SizeArg = LinkEntry->SizeArg;
-
-  auto *ThenBlock = BasicBlock::Create(F.getContext(), "", &F);
-  auto *ElseBlock = BasicBlock::Create(F.getContext(), "", &F);
-
-  // Move all instructions after the last GEP instruction to the new block
-  ThenBlock->splice(ThenBlock->begin(), &Block, GetElementPtr, Block.end());
-
-  auto *SizeCheck = Builder.CreateICmpULT(IndexOperand, SizeArg);
-
-  IRBuilder<> ElseBuilder(ElseBlock);
-
-  // get_global_id(0)
-  auto GetGlobalIdFC = F.getParent()->getOrInsertFunction(
-      get_global_id_name,
-      FunctionType::get(IntegerType::getInt64Ty(F.getContext()),
-                        {IntegerType::getInt32Ty(F.getContext())}, false));
-  auto GetGlobalIdFunc = cast<Function>(GetGlobalIdFC.getCallee());
-  GetGlobalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
-  auto GlobalIdCall = ElseBuilder.CreateCall(
-      GetGlobalIdFC,
-      {ConstantInt::get(IntegerType::getInt32Ty(F.getContext()), 0)});
-  GlobalIdCall->setCallingConv(CallingConv::SPIR_FUNC);
-
-  // get_local_id(0)
-  auto GetLocalIdFC = F.getParent()->getOrInsertFunction(
-      get_local_id_name,
-      FunctionType::get(IntegerType::getInt64Ty(F.getContext()),
-                        {IntegerType::getInt32Ty(F.getContext())}, false));
-  auto GetLocalIdFunc = cast<Function>(GetLocalIdFC.getCallee());
-  GetLocalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
-  auto LocalIdCall = ElseBuilder.CreateCall(
-      GetLocalIdFC,
-      {ConstantInt::get(IntegerType::getInt32Ty(F.getContext()), 0)});
-  LocalIdCall->setCallingConv(CallingConv::SPIR_FUNC);
-
-  const auto PrintfFunc = F.getParent()->getOrInsertFunction(
-      "printf",
-      FunctionType::get(IntegerType::getInt32Ty(F.getContext()),
-                        PointerType::get(Type::getInt8Ty(F.getContext()), ConstantAddressSpace),
-                        true));
-
-  auto PrintfCI = ElseBuilder.CreateCall(PrintfFunc, {MessageCtx.FormatIndexOutOfBounds, GlobalIdCall, LocalIdCall});
-  PrintfCI->setCallingConv(CallingConv::SPIR_FUNC);
-
-  ElseBuilder.CreateRetVoid();
-
-  Builder.CreateCondBr(SizeCheck, ThenBlock, ElseBlock);
-
-  traverse(F, ArraySizeLinks, *ThenBlock, depth + 1, MessageCtx);
 }
 
 static std::vector<ArraySizeLink> find_array_size_links(Function &F) {
