@@ -4,8 +4,6 @@ SPIR-V にコンパイルされたOpenCL カーネルのバイナリを検証す
 CUDAの [Compute Sanitizer](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html)
 と似たようなものをSPIR-Vで実現することを目指します。
 
-とりあえず今はSPIR-Vのバイナリを読み込んで動かすだけのものです。
-
 ## 使い方
 
 必要なもの (Arch Linux パッケージ):

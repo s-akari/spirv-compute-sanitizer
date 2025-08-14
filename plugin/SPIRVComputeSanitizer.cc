@@ -115,28 +115,6 @@ struct ArraySizeLink {
   Argument *SizeArg;
 };
 
-struct SanitizerMessages {
-  bool Created = false;
-  GlobalVariable *FormatIndexOutOfBounds = nullptr;
-  GlobalVariable *FormatLocalMemoryConflict = nullptr;
-
-  void createFormatStrings(IRBuilder<> &Builder) {
-    if (Created)
-      return;
-
-    FormatIndexOutOfBounds =
-        Builder.CreateGlobalString("\n[ComputeSanitizer] (Global #%zu, Local "
-                                   "#%zu) Array index out of bounds\n",
-                                   "", ConstantAddressSpace);
-    FormatLocalMemoryConflict = Builder.CreateGlobalString(
-        "\n[ComputeSanitizer] (Global #%zu, Local "
-        "#%zu) Local memory conflict detected (Previously wrote by #%zu)\n",
-        "", ConstantAddressSpace);
-
-    Created = true;
-  }
-};
-
 static CallInst *add_sanitizer_call(IRBuilder<> &Builder, const StringRef Name,
                                     ArrayRef<Value *> Args) {
   const auto Func =
@@ -155,6 +133,26 @@ static CallInst *add_sanitizer_call(IRBuilder<> &Builder, const StringRef Name,
   return Call;
 }
 
+static CallInst *create_atomic_exchange_call(IRBuilder<> &Builder, Value *Ptr,
+                                             Value *Val) {
+  auto AtomicExchangeFC =
+      Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
+          "_Z15atomic_exchangePU3AS4VU7_Atomicmm",
+          FunctionType::get(
+              IntegerType::getInt64Ty(Builder.getContext()),
+              {PointerType::get(IntegerType::getInt64Ty(Builder.getContext()),
+                                4),
+               Val->getType()},
+              false));
+  auto CastPtr = Builder.CreateAddrSpaceCast(Ptr, PointerType::get(
+      IntegerType::getInt64Ty(Builder.getContext()), 4));
+
+  auto *AtomicExchangeFunc = cast<Function>(AtomicExchangeFC.getCallee());
+  AtomicExchangeFunc->setCallingConv(CallingConv::SPIR_FUNC);
+
+  return Builder.CreateCall(AtomicExchangeFC, {CastPtr, Val});
+}
+
 static CallInst *create_get_global_id_call(IRBuilder<> &Builder, unsigned dim) {
   auto GetGlobalIdFC =
       Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
@@ -167,6 +165,21 @@ static CallInst *create_get_global_id_call(IRBuilder<> &Builder, unsigned dim) {
 
   return Builder.CreateCall(
       GetGlobalIdFC,
+      {ConstantInt::get(IntegerType::getInt32Ty(Builder.getContext()), dim)});
+}
+
+static CallInst *create_get_local_id_call(IRBuilder<> &Builder, unsigned dim) {
+  auto GetLocalIdFC =
+      Builder.GetInsertBlock()->getModule()->getOrInsertFunction(
+          get_local_id_name,
+          FunctionType::get(IntegerType::getInt64Ty(Builder.getContext()),
+                            {IntegerType::getInt32Ty(Builder.getContext())},
+                            false));
+  auto *GetLocalIdFunc = cast<Function>(GetLocalIdFC.getCallee());
+  GetLocalIdFunc->setCallingConv(CallingConv::SPIR_FUNC);
+
+  return Builder.CreateCall(
+      GetLocalIdFunc,
       {ConstantInt::get(IntegerType::getInt32Ty(Builder.getContext()), dim)});
 }
 
@@ -308,7 +321,6 @@ find_injectable_local_mem_store(
 static std::pair<BasicBlock *, BranchInst *>
 inject_gep_check(Function &F, BasicBlock &Block, IRBuilder<> &Builder,
                  std::vector<ArraySizeLink> &ArraySizeLinks,
-                 SanitizerMessages Messages,
                  const std::pair<BasicBlock::iterator, Argument *> &gep_pair) {
   auto GetElementPtr = gep_pair.first;
   auto *PtrOperand = gep_pair.second;
@@ -337,9 +349,7 @@ inject_gep_check(Function &F, BasicBlock &Block, IRBuilder<> &Builder,
 
   IRBuilder<> ElseBuilder(ElseBlock);
 
-  add_sanitizer_call(ElseBuilder,
-                     "libscsan_report_index_out_of_bounds",
-                     {});
+  add_sanitizer_call(ElseBuilder, "libscsan_report_index_out_of_bounds", {});
 
   ElseBuilder.CreateRetVoid();
 
@@ -350,7 +360,6 @@ inject_gep_check(Function &F, BasicBlock &Block, IRBuilder<> &Builder,
 
 static std::pair<BasicBlock *, BranchInst *> inject_shadow_local_mem_check(
     Function &F, BasicBlock &Block, IRBuilder<> &Builder,
-    SanitizerMessages &Messages,
     std::pair<BasicBlock::iterator, GlobalVariable *> shadow_var_pair) {
   auto Store = shadow_var_pair.first;
   auto *ShadowBufVar = shadow_var_pair.second;
@@ -365,49 +374,59 @@ static std::pair<BasicBlock *, BranchInst *> inject_shadow_local_mem_check(
   auto *ShadowPtr = Builder.CreateInBoundsGEP(
       ShadowBufVar->getValueType(), ShadowBufVar,
       {ConstantInt::get(Type::getInt64Ty(F.getContext()), 0), IndexOperand});
-  auto *ShadowVar = Builder.CreateLoad(ShadowVarTy, ShadowPtr);
+
+  auto BuilderCurrLid = Builder.CreateAdd(create_get_local_id_call(Builder, 0), ConstantInt::get(ShadowVarTy, 1));
+  auto *ShadowVar = create_atomic_exchange_call(Builder, ShadowPtr, BuilderCurrLid);
+  auto *ShadowVarArea = Builder.CreateAlloca(ShadowVarTy);
+
+  Builder.CreateStore(ShadowVar, ShadowVarArea);
 
   auto ThenBlock = BasicBlock::Create(F.getContext(), "", &F);
   auto ElseBlock = BasicBlock::Create(F.getContext(), "", &F);
 
-  auto BranchInst = Builder.CreateCondBr(
-      Builder.CreateICmpEQ(ShadowVar,
-                           ConstantInt::get(ShadowVar->getType(), 0)),
-      ThenBlock, ElseBlock);
+  auto EQCond = Builder.CreateICmpEQ(ShadowVar, BuilderCurrLid);
+  auto FirstWriteCond = Builder.CreateICmpEQ(ShadowVar, ConstantInt::get(ShadowVarTy, 0));
+
+  Builder.CreateCondBr(Builder.CreateOr(EQCond, FirstWriteCond), ThenBlock,
+                       ElseBlock);
 
   IRBuilder<> ThenBuilder(ThenBlock);
 
-  ThenBlock->splice(ThenBlock->begin(), &Block, Store->getIterator(),
-                    Block.end());
+  auto ThenBuilderCurrLid = ThenBuilder.CreateAdd(create_get_local_id_call(ThenBuilder, 0), ConstantInt::get(ShadowVarTy, 1));
+  auto *ShadowVar2 = create_atomic_exchange_call(ThenBuilder, ShadowPtr, ThenBuilderCurrLid);
 
-  // Need to preserve first store to local memory to avoid recursion
-  ThenBuilder.SetInsertPoint(ThenBlock->begin()->getNextNode());
+  ThenBuilder.CreateStore(ShadowVar2, ShadowVarArea);
 
-  // shadow[idx] = get_global_id(0) + 1
-  ThenBuilder.CreateStore(
-      ThenBuilder.CreateAdd(create_get_global_id_call(ThenBuilder, 0),
-                            ConstantInt::get(ShadowVarTy, 1)),
-      ShadowPtr);
+  // Second check
+
+  auto Then2Block = BasicBlock::Create(F.getContext(), "", &F);
+
+  Then2Block->splice(Then2Block->begin(), &Block, Store->getIterator(),
+                     Block.end());
+
+  auto Branch2Inst = ThenBuilder.CreateCondBr(
+      ThenBuilder.CreateICmpEQ(ShadowVar2, ThenBuilderCurrLid), Then2Block,
+      ElseBlock);
 
   // In the else block, we have a conflict
   IRBuilder<> ElseBuilder(ElseBlock);
 
-  add_sanitizer_call(
-      ElseBuilder, "libscsan_report_local_memory_conflict",
-      {ElseBuilder.CreateSub(ElseBuilder.CreateLoad(ShadowVarTy, ShadowPtr),
-                             ConstantInt::get(ShadowVarTy, 1))});
+  add_sanitizer_call(ElseBuilder, "libscsan_report_local_memory_conflict",
+                     {ElseBuilder.CreateSub(
+                         ElseBuilder.CreateLoad(
+                             ShadowVarArea->getAllocatedType(), ShadowVarArea),
+                         ConstantInt::get(ShadowVarTy, 1))});
 
   ElseBuilder.CreateRetVoid();
 
-  return {ThenBlock, BranchInst};
+  return {Then2Block, Branch2Inst};
 }
 
 struct TraverseContext {
   Function &F;
   std::vector<ShadowLocalMemLink> &ShadowLocalMemLinks;
   std::vector<ArraySizeLink> &ArraySizeLinks;
-  SanitizerMessages Messages{};
-  std::vector<unsigned> branchesAddedBySanitizer{};
+  std::vector<BasicBlock::const_iterator> skipInstructions{};
 
   TraverseContext(Function &F,
                   std::vector<ShadowLocalMemLink> &ShadowLocalMemLinks,
@@ -424,25 +443,22 @@ static void traverse(BasicBlock &Block, TraverseContext &Ctx,
 
   // Create a global string variable once to avoid string deduplication bug
   IRBuilder<> Builder(&Block);
-  Ctx.Messages.createFormatStrings(Builder);
 
   auto Inst = Block.begin();
 
-  if (depth > 0)
-    ++Inst; // Skip first getelementptr / store
-
   for (const auto E = Block.end(); Inst != E; ++Inst) {
+    if (Ctx.skipInstructions.size() > 0 &&
+        std::any_of(Ctx.skipInstructions.begin(), Ctx.skipInstructions.end(),
+                    [&](BasicBlock::const_iterator i) {
+                      return i == Inst->getIterator();
+                    })) {
+      errs() << "Skipping instruction already processed: " << *Inst << "\n";
+
+      continue; // Skip instructions already processed
+    }
+
     if (const auto *Br = dyn_cast<BranchInst>(Inst)) {
       // Follow the branch instruction to the next block
-      if (std::any_of(Ctx.branchesAddedBySanitizer.begin(),
-                      Ctx.branchesAddedBySanitizer.end(),
-                      [&](unsigned id) { return id == Br->getValueID(); })) {
-        errs() << "Skipping branch instruction already added by sanitizer: "
-               << *Br << "\n";
-
-        continue; // Skip branches already added by sanitizer
-      }
-
       if (Br->isConditional()) {
         traverse(*Br->getSuccessor(0), Ctx, depth + 1);
         traverse(*Br->getSuccessor(1), Ctx, depth + 1);
@@ -459,6 +475,8 @@ static void traverse(BasicBlock &Block, TraverseContext &Ctx,
       if (maybe_gep_pair) {
         errs() << "Found injectable GEP instruction: " << *Inst << "\n";
 
+        Ctx.skipInstructions.push_back(GetElementPtr->getIterator());
+
         break;
       }
     }
@@ -471,6 +489,8 @@ static void traverse(BasicBlock &Block, TraverseContext &Ctx,
       if (maybe_shadow_var_pair) {
         errs() << "Found store to local memory: " << *Store << "\n";
 
+        Ctx.skipInstructions.push_back(Store->getIterator());
+
         break;
       }
     }
@@ -478,19 +498,14 @@ static void traverse(BasicBlock &Block, TraverseContext &Ctx,
 
   if (maybe_shadow_var_pair) {
     auto [ThenBlock, BI] = inject_shadow_local_mem_check(
-        Ctx.F, Block, Builder, Ctx.Messages, maybe_shadow_var_pair.value());
-
-    Ctx.branchesAddedBySanitizer.push_back(BI->getValueID());
+        Ctx.F, Block, Builder, maybe_shadow_var_pair.value());
 
     traverse(*ThenBlock, Ctx, depth + 1);
   }
 
   if (maybe_gep_pair) {
-    auto [ThenBlock, BI] =
-        inject_gep_check(Ctx.F, Block, Builder, Ctx.ArraySizeLinks,
-                         Ctx.Messages, maybe_gep_pair.value());
-
-    Ctx.branchesAddedBySanitizer.push_back(BI->getValueID());
+    auto [ThenBlock, BI] = inject_gep_check(
+        Ctx.F, Block, Builder, Ctx.ArraySizeLinks, maybe_gep_pair.value());
 
     traverse(*ThenBlock, Ctx, depth + 1);
   }

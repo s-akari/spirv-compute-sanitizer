@@ -13,7 +13,7 @@ LDFLAGS=-lOpenCL
 C_SRCS := $(wildcard runner/*.c)
 CL_SRCS := $(wildcard kernel/*.cl)
 COMMON_SRCS := $(wildcard common/*.c)
-RUNTIME_SRCS := $(wildcard runtime/*.cl)
+RUNTIME_SRC := runtime/lib.cl
 
 BIN_TARGETS := $(patsubst runner/%.c,$(OUT_BIN)/%,${C_SRCS})
 KERNEL_TARGETS := $(patsubst kernel/%.cl,$(OUT_KERNEL)/%.spv,${CL_SRCS})
@@ -32,14 +32,14 @@ $(OUT_OBJ)/%.o: common/%.c | $(OUT_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUT_RUNTIME)/%.spv: runtime/%.cl | $(OUT_RUNTIME)
-	$(CLANG) -target spirv64 -O2 -c $< -o $@
+	$(CLANG) -target spirv64 -O2 -cl-std=CL3.0 -c $< -o $@
 
 # Link runtime SPIRV files into libscsan_rt.spv
-$(OUT_RUNTIME)/libscsan_rt.spv: $(RUNTIME_TARGETS) | $(OUT_RUNTIME)
-	$(CLANG) -target spirv64 -O2 -Wl,--use-highest-version $^ -o $@
+$(OUT_RUNTIME)/libscsan_rt.spv: $(RUNTIME_SRC) | $(OUT_RUNTIME)
+	$(CLANG) -target spirv64 -O2 -cl-std=CL3.0 -c $^ -o $@
 
 $(OUT_KERNEL)/%.spv: kernel/%.cl | $(OUT_KERNEL)
-	$(CLANG) -target spirv64 -O2 -fpass-plugin=plugin/build/libSPIRVComputeSanitizer.so -Wl,--allow-pointer-mismatch -Wl,--use-highest-version $(OUT_RUNTIME)/libscsan_rt.spv $< -o $@
+	$(CLANG) -target spirv64 -O2 -cl-std=CL3.0 -fpass-plugin=plugin/build/libSPIRVComputeSanitizer.so -Wl,--allow-pointer-mismatch -Wl,--use-highest-version $(OUT_RUNTIME)/libscsan_rt.spv $< -o $@
 
 .PHONY: runner/%.c runtime/%.cl kernel/%.cl
 
