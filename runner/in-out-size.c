@@ -65,9 +65,9 @@ int run_kernel(OpenCLContext *ctx, OpenCLBuffers *buffers) {
   err = clSetKernelArg(ctx->kernel, 1, sizeof(cl_mem), &buffers->d_out);
   CHECK_CL_ERROR(err, "Error in setting kernel argument d_out");
 
-  const int size = ARRAY_SIZE;
+  const unsigned long size = ARRAY_SIZE;
 
-  err = clSetKernelArg(ctx->kernel, 2, sizeof(int), &size);
+  err = clSetKernelArg(ctx->kernel, 2, sizeof(unsigned long), &size);
   CHECK_CL_ERROR(err, "Error in setting kernel argument size");
 
   // Enqueue kernel
