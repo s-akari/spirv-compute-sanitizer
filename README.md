@@ -73,6 +73,17 @@ make build-runner/a-b-c # runner/a-b-c.c -> out/bin/a-b-c
 out/bin/a-b-c out/kernel/add.spv
 ```
 
+### 手動で適用する
+
+別のOpenCL C カーネルに組み込む場合、**Sanitizer Pass Plugin**および**ランタイムライブラリ (`libscsan_rt.spv`)** が必要です。
+失敗を防ぐため、**リンカフラグにあらかじめ`--allow-pointer-mismatch --use-highest-version`を指定するようにしてください**。
+
+```bash
+clang -target spirv64 -O2 -cl-std=CL3.0 -fpass-plugin=plugin/build/libSPIRVComputeSanitizer.so -Wl,--allow-pointer-mismatch -Wl,--use-highest-version out/runtime/libscsan_rt.spv -o a.spv kernel.cl
+```
+
+これで生成された`a.spv`を、OpenCL ICDローダー等で`clCreateProgramWithIL`を使用し読み込んでください。
+
 ### Sanitizer の機能
 
 #### ASan: Array index out of bounds
